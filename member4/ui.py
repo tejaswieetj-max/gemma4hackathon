@@ -4,7 +4,7 @@ import base64
 import requests
 import gradio as gr
 
-API_URL = "http://localhost:8000/api/v1/check"
+API_URL = os.environ.get("API_URL", "http://127.0.0.1:8000/api/v1/check")
 
 # ---------------------------------------------------------------------------
 # Text extraction from uploaded documents
