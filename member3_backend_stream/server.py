@@ -77,10 +77,9 @@ def check_canary_leak(response_text: str) -> dict:
 # Regex patterns for sensitive data that should NEVER appear in AI output
 SENSITIVE_PATTERNS = {
     "email": r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
-    "phone_number": r'(?:\+91[\s-]?)?[6-9]\d{9}',                      # Indian phone numbers
+    "phone_number": r'(?:\+91[\s-]?)?[6-9]\d{9}',                        # Indian phone numbers
     "api_key": r'(?:sk|pk|api|key|token)[-_]?[a-zA-Z0-9]{20,}',        # API keys
     "credit_card": r'\b(?:\d{4}[-\s]?){3}\d{4}\b',                      # Credit card numbers
-    "aadhaar": r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}\b',                     # Aadhaar numbers
     "pan_card": r'\b[A-Z]{5}\d{4}[A-Z]\b',                             # PAN card numbers
     "ipv4_address": r'\b(?:\d{1,3}\.){3}\d{1,3}\b',                    # IP addresses
     "file_path": r'(?:\/[\w.-]+){3,}|(?:[A-Z]:\\[\w\\.-]+)',            # System file paths
@@ -154,13 +153,15 @@ class StreamPayload(BaseModel):
     source: str  # "user_prompt" | "rag_document" | "tool_output"
     text: str
 
+
 # =========================================================
 # MEMBER 2 MATH ENGINE INTEGRATION
 # =========================================================
 try:
     from member2_math_security.anomaly_engine import run_math_check as real_math_check
     async def math_check_adapter(text: str):
-        return real_math_check(text)
+        # Run synchronous math calculation in threadpool to keep stream fast
+        return await asyncio.to_thread(real_math_check, text)
     active_math_check = math_check_adapter
     print("[INTEGRATION] Real Member 2 Math Engine loaded successfully.")
 except ImportError:
@@ -175,26 +176,45 @@ except ImportError:
     active_math_check = mock_math_check
 
 
-async def mock_gemma_guard(text: str):
-    """Member 1's Gemma Guard classifier (mocked for independent testing)."""
-    await asyncio.sleep(0.3)
-    triggers = ["lock", "ignore", "malicious", "jailbreak", "hack",
-                "override", "reveal", "system prompt", "bypass", "DAN"]
-    if any(w in text.lower() for w in triggers):
-        return {
-            "verdict": "MALICIOUS",
-            "confidence": 0.92,
-            "reasoning": "Detected prompt override / harmful request disguised as roleplay or story.",
-            "detected_language": "English / Tanglish",
-            "attack_type": "hypothetical_roleplay"
-        }
-    return {
-        "verdict": "CLEAN",
-        "confidence": 0.97,
-        "reasoning": "Input adheres strictly to safe operational boundaries.",
-        "detected_language": "English",
-        "attack_type": "none"
-    }
+# =========================================================
+# MEMBER 1 GEMMA GUARD INTEGRATION
+# =========================================================
+try:
+    from member1.guard_service import call_gemma_guard as real_gemma_guard
+    async def active_gemma_guard(text: str):
+        # Run blocking model inference in threadpool so the stream event loop isn't stalled
+        return await asyncio.to_thread(real_gemma_guard, text)
+    print("[INTEGRATION] Real Member 1 Gemma Guard loaded successfully.")
+except ImportError:
+    try:
+        from member1_gemma_core.guard_service import call_gemma_guard as real_gemma_guard
+        async def active_gemma_guard(text: str):
+            return await asyncio.to_thread(real_gemma_guard, text)
+        print("[INTEGRATION] Real Member 1 Gemma Guard loaded successfully.")
+    except ImportError:
+        async def mock_gemma_guard(text: str):
+            """Fallback Mock for independent testing."""
+            await asyncio.sleep(0.3)
+            triggers = ["lock", "ignore", "malicious", "jailbreak", "hack",
+                        "override", "reveal", "system prompt", "bypass", "DAN"]
+            if any(w in text.lower() for w in triggers):
+                return {
+                    "verdict": "MALICIOUS",
+                    "confidence": 0.92,
+                    "reasoning": "Detected prompt override / harmful request disguised as roleplay or story.",
+                    "detected_language": "English / Tanglish",
+                    "attack_type": "hypothetical_roleplay"
+                }
+            return {
+                "verdict": "CLEAN",
+                "confidence": 0.97,
+                "reasoning": "Input adheres strictly to safe operational boundaries.",
+                "detected_language": "English",
+                "attack_type": "none"
+            }
+        active_gemma_guard = mock_gemma_guard
+        print("[INTEGRATION] Using Fallback Mock Gemma Guard.")
+
 
 async def mock_gemma_task_stream(text: str):
     """Simulates Gemma Task model streaming a response word-by-word."""
@@ -244,7 +264,7 @@ async def speculative_stream_endpoint(payload: StreamPayload, request: Request):
     async def event_generator():
         # 1. Launch Math Check & Gemma Guard concurrently in background
         math_task = asyncio.create_task(active_math_check(payload.text))
-        guard_task = asyncio.create_task(mock_gemma_guard(payload.text))
+        guard_task = asyncio.create_task(active_gemma_guard(payload.text))
 
         stream_cancelled = False
         tokens_streamed = 0
@@ -295,11 +315,43 @@ async def speculative_stream_endpoint(payload: StreamPayload, request: Request):
             full_response_buffer.append(token)
             yield token
 
-        # If stream finished cleanly
+        # 3. IF GENERATOR FINISHED BUT GUARD IS STILL RUNNING OR WAS MALICIOUS
         if not stream_cancelled:
+            # Await guard and math tasks if they haven't finished yet
             guard_res = await guard_task
             math_res = await math_task
             guard_check_time_ms = round((time.time() - request_start_time) * 1000, 1)
+
+            # Check verdict AFTER token streaming completes
+            if guard_res["verdict"] == "MALICIOUS":
+                threat = calculate_threat_tier(guard_res, math_res)
+                client_threat_counter[client_ip] += 1
+                repeat_count = client_threat_counter[client_ip]
+
+                intercept_payload = {
+                    "event": "STREAM_INTERCEPTED",
+                    "status": "BLOCKED",
+                    "threat_tier": threat,
+                    "guard": guard_res,
+                    "math": math_res,
+                    "tokens_streamed_before_kill": tokens_streamed,
+                    "guard_latency_ms": guard_check_time_ms,
+                    "repeat_offenses_from_client": repeat_count,
+                    "tarpit": tarpit_info,
+                    "timestamp": datetime.now().isoformat()
+                }
+
+                audit_log.append({
+                    "type": "BLOCKED",
+                    "client_ip": client_ip,
+                    "source": payload.source,
+                    "input_preview": payload.text[:100],
+                    **intercept_payload
+                })
+
+                yield f"\n\n[STREAM_KILLED_BY_SENTINEL]: {json.dumps(intercept_payload)}\n"
+                return
+
             threat = calculate_threat_tier(guard_res, math_res)
 
             # NOVELTY #6: Check for canary token leak in the full response
@@ -307,7 +359,6 @@ async def speculative_stream_endpoint(payload: StreamPayload, request: Request):
             canary_check = check_canary_leak(full_response_text)
 
             if canary_check["canary_leaked"]:
-                # System prompt was extracted! Block this retroactively
                 client_threat_counter[client_ip] += 1
                 leak_payload = {
                     "event": "CANARY_LEAK_DETECTED",
@@ -331,7 +382,6 @@ async def speculative_stream_endpoint(payload: StreamPayload, request: Request):
             # NOVELTY #7: Sanitize the response for PII/secrets
             sanitize_result = sanitize_response(full_response_text)
 
-            # Calculate latency savings
             total_time_ms = round((time.time() - request_start_time) * 1000, 1)
             sequential_estimate_ms = total_time_ms + guard_check_time_ms
             time_saved_ms = round(sequential_estimate_ms - total_time_ms, 1)
@@ -386,7 +436,7 @@ async def simple_check_endpoint(payload: StreamPayload, request: Request):
     # Run guard and math check concurrently
     math_res, guard_res = await asyncio.gather(
         active_math_check(payload.text),
-        mock_gemma_guard(payload.text)
+        active_gemma_guard(payload.text)
     )
 
     guard_latency_ms = round((time.time() - request_start_time) * 1000, 1)
