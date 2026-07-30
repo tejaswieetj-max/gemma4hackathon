@@ -39,6 +39,7 @@ def _get_api_key() -> str:
     if key:
         return key.strip().strip("'\"")
 
+    # Check local .env file manually as fallback
     if os.path.exists(".env"):
         try:
             with open(".env", "r", encoding="utf-8") as f:
@@ -65,6 +66,7 @@ def _get_api_key() -> str:
 
     return ""
 
+# Fetch key and configure client dynamically
 GEMINI_API_KEY = _get_api_key()
 MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest")
 
@@ -131,8 +133,7 @@ def _extract_json(raw_text: str) -> dict:
         cleaned = match.group(0)
     return json.loads(cleaned)
 
-
-def _parse_and_validate_response(response_text: str, heuristics) -> dict:
+def _parse_and_validate_response(response_text: str, heuristics: Any = None) -> dict:
     """Parse, validate, and enrich an LLM response dict. Raises on invalid."""
     parsed = _extract_json(response_text)
     required = {"verdict", "risk_score", "reasoning", "detected_language", "attack_type"}
@@ -144,8 +145,8 @@ def _parse_and_validate_response(response_text: str, heuristics) -> dict:
     parsed["perplexity_score"] = float(parsed.get("perplexity_score", 0.0))
     parsed["vector_drift"] = float(parsed.get("vector_drift", 0.0))
     parsed["risk_score"] = float(parsed["risk_score"])
-    parsed["heuristic_hits"] = heuristics.hits
-    parsed["heuristic_score"] = heuristics.score
+    parsed["heuristic_hits"] = getattr(heuristics, "hits", [])
+    parsed["heuristic_score"] = getattr(heuristics, "score", 0.0)
     return parsed
 
 def _offline_fallback_guard(content: str, source_type: str, heuristics: Any = None) -> dict:
@@ -159,7 +160,7 @@ def _offline_fallback_guard(content: str, source_type: str, heuristics: Any = No
 
     is_hindi_script = bool(re.search(r"[\u0900-\u097F]", content))
 
-    if heuristics and heuristics.hits:
+    if heuristics and getattr(heuristics, "hits", None):
         reasoning = f"Offline scanner: Triggered tripwires ({', '.join(heuristics.hits[:2])})."
         risk_score = min(1.0, 0.5 + heuristics.score * 0.5)
 
@@ -189,20 +190,20 @@ def _offline_fallback_guard(content: str, source_type: str, heuristics: Any = No
             detected_language = "Tanglish"
         else:
             detected_language = "Hinglish"
-            
-    # NOTE: "banana" indirect injection tripwire removed — was a debug artifact
-    # that caused false positives on clean indirect documents.
+
+    heuristic_score = getattr(heuristics, "score", 0.0)
+    heuristic_hits = getattr(heuristics, "hits", [])
 
     return {
-        "verdict": "MALICIOUS" if (is_malicious or (heuristics and heuristics.score >= 0.85)) else "CLEAN",
+        "verdict": "MALICIOUS" if (is_malicious or (heuristics and heuristic_score >= 0.85)) else "CLEAN",
         "risk_score": risk_score,
         "perplexity_score": 0.0,
         "vector_drift": 0.0,
         "reasoning": reasoning,
         "detected_language": detected_language,
         "attack_type": attack_type,
-        "heuristic_hits": heuristics.hits if heuristics else [],
-        "heuristic_score": heuristics.score if heuristics else 0.0
+        "heuristic_hits": heuristic_hits,
+        "heuristic_score": heuristic_score
     }
 
 def call_gemma_guard(content: str, source_type: str = "direct", max_retries: int = 2) -> dict:
@@ -224,7 +225,7 @@ def call_gemma_guard(content: str, source_type: str = "direct", max_retries: int
             logger.warning(f"Client initialization failed: {e}")
             return _offline_fallback_guard(content, source_type, heuristics)
 
-    heuristics_hint = f"\nPre-screen tripwire hits: {', '.join(heuristics.hits)}" if heuristics.hits else ""
+    heuristics_hint = f"\nPre-screen tripwire hits: {', '.join(heuristics.hits)}" if getattr(heuristics, "hits", None) else ""
     prompt = f"{GUARD_SYSTEM_PROMPT.format(attack_types=', '.join(ATTACK_TYPES))}{heuristics_hint}\n\nCONTENT TO ANALYZE (source_type: {source_type}):\n---\n{content}\n---"
     
     last_error = "unknown"
