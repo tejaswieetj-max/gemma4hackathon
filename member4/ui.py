@@ -1,489 +1,486 @@
-import json
 import os
+import re
+import base64
 import gradio as gr
-import requests
 
-API_URL = "http://localhost:8000/api/v1/check"
+# ---------------------------------------------------------------------------
+# Text extraction from uploaded documents
+# ---------------------------------------------------------------------------
+def extract_text_from_file(file_path: str) -> str:
+    ext = os.path.splitext(file_path)[1].lower()
 
-json_path = os.path.join(os.path.dirname(__file__), "test_suite.json")
-try:
-    with open(json_path, "r", encoding="utf-8") as f:
-        test_suite = json.load(f)
-except Exception:
-    test_suite = []
+    if ext in [".txt", ".md", ".csv", ".log"]:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
 
-CATEGORY_LABELS = {
-    "clean": "Clean",
-    "direct_injection": "Direct Injection",
-    "indirect_injection": "Indirect Injection",
-    "hypothetical_roleplay": "Roleplay Jailbreak",
-    "obfuscated_encoding": "Obfuscated / Encoded",
-}
+    if ext == ".pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(file_path)
+            return "\n".join(page.extract_text() or "" for page in reader.pages)
+        except ImportError:
+            return "[ERROR] pypdf not installed — cannot read PDF. Run: pip install pypdf --break-system-packages"
+        except Exception as e:
+            return f"[ERROR] Failed to read PDF: {e}"
+
+    if ext == ".docx":
+        try:
+            import docx
+            d = docx.Document(file_path)
+            return "\n".join(p.text for p in d.paragraphs)
+        except ImportError:
+            return "[ERROR] python-docx not installed — cannot read DOCX. Run: pip install python-docx --break-system-packages"
+        except Exception as e:
+            return f"[ERROR] Failed to read DOCX: {e}"
+
+    # Fallback: try reading as plain text regardless of extension
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception as e:
+        return f"[ERROR] Unsupported or unreadable file: {e}"
 
 
-def get_mock_response(text: str) -> dict:
+# ---------------------------------------------------------------------------
+# Hidden-content detection
+# ---------------------------------------------------------------------------
+ZERO_WIDTH_CHARS = ["\u200b", "\u200c", "\u200d", "\ufeff", "\u2060"]
+
+MALICIOUS_KEYWORDS = [
+    "dan",
+    "ignore",
+    "disregard",
+    "pick a lock",
+    "maranthuko",
+    "bhool jao",
+    "bypassing",
+    "bypass",
+    "explosive",
+    "admin password",
+    "developer mode",
+    "override",
+    "secret",
+    "token",
+    "attacker.com",
+    "thalli",
+    "system prompt",
+    "reveal your instructions",
+]
+
+TANGLISH_MARKERS = ["maranthuko", "sollu", "mami", "nanba", "machan", "thalli", "anna"]
+HINGLISH_MARKERS = ["bhool jao", "batao", "samjha do", "banao", "purani", "purana"]
+
+
+def find_zero_width_chars(text: str) -> list:
+    found = []
+    for ch in ZERO_WIDTH_CHARS:
+        if ch in text:
+            found.append(f"U+{ord(ch):04X}")
+    return found
+
+
+def find_and_decode_base64(text: str) -> list:
+    """Find base64-looking substrings (20+ chars) and try to decode them."""
+    candidates = re.findall(r"[A-Za-z0-9+/]{20,}={0,2}", text)
+    decoded_hits = []
+    for c in candidates:
+        try:
+            decoded = base64.b64decode(c, validate=True).decode("utf-8", errors="strict")
+            # only keep it if it decodes to plausible readable text
+            if decoded.isprintable() and len(decoded) > 3:
+                decoded_hits.append({"encoded": c, "decoded": decoded})
+        except Exception:
+            continue
+    return decoded_hits
+
+
+def detect_language(text: str) -> str:
     text_lower = text.lower()
-    is_malicious = any(
-        kw in text_lower
-        for kw in [
-            "dan",
-            "ignore",
-            "disregard",
-            "pick a lock",
-            "maranthuko",
-            "bhool jao",
-            "bypassing",
-            "explosive",
-            "swdub3jl",
-            "admin password",
-        ]
+    if any(kw in text_lower for kw in TANGLISH_MARKERS):
+        return "Tanglish"
+    if any(kw in text_lower for kw in HINGLISH_MARKERS):
+        return "Hinglish"
+    return "English"
+
+
+def contains_malicious_keywords(text: str) -> bool:
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in MALICIOUS_KEYWORDS)
+
+
+def scan_document(file):
+    if file is None:
+        return (
+            format_verdict_html("EMPTY"),
+            "No document uploaded.",
+            "",  # language hidden when not malicious/empty
+        )
+
+    text = extract_text_from_file(file.name)
+
+    if text.startswith("[ERROR]"):
+        return (
+            format_verdict_html("ERROR"),
+            text,
+            "",
+        )
+
+    # 1. Check visible text for direct/roleplay injection keywords
+    visible_flagged = contains_malicious_keywords(text)
+
+    # 2. Check for zero-width / invisible unicode characters (a real hiding technique)
+    zero_width_found = find_zero_width_chars(text)
+
+    # 3. Find and decode base64 blocks, check decoded content for injection intent
+    decoded_blocks = find_and_decode_base64(text)
+    decoded_flagged = any(contains_malicious_keywords(b["decoded"]) for b in decoded_blocks)
+
+    is_malicious = visible_flagged or decoded_flagged or bool(zero_width_found)
+
+    # Build the "hidden text" report
+    hidden_report_parts = []
+    if zero_width_found:
+        hidden_report_parts.append(
+            f"⚠️ Invisible/zero-width Unicode characters detected: {', '.join(zero_width_found)}\n"
+            "These characters render as blank space but can be used to smuggle hidden instructions "
+            "or break up flagged keywords to dodge simple filters."
+        )
+    if decoded_blocks:
+        for b in decoded_blocks:
+            flag = "🚨 MALICIOUS CONTENT" if contains_malicious_keywords(b["decoded"]) else "benign"
+            hidden_report_parts.append(
+                f"🔐 Base64 block decoded ({flag}):\n"
+                f"   Encoded: {b['encoded'][:60]}{'...' if len(b['encoded']) > 60 else ''}\n"
+                f"   Decoded: \"{b['decoded']}\""
+            )
+    if visible_flagged and not decoded_blocks and not zero_width_found:
+        hidden_report_parts.append(
+            "🚨 Suspicious instruction-override language detected directly in the visible document text "
+            "(e.g. 'ignore previous instructions', 'developer mode', 'reveal system prompt')."
+        )
+    if not hidden_report_parts:
+        hidden_report_parts.append("✅ No hidden or obfuscated content detected in this document.")
+
+    hidden_text_report = "\n\n".join(hidden_report_parts)
+
+    verdict_key = "MALICIOUS" if is_malicious else "CLEAN"
+    language_display = detect_language(text) if is_malicious else ""
+
+    return (
+        format_verdict_html(verdict_key),
+        hidden_text_report,
+        format_language_html(language_display) if is_malicious else "",
     )
-    is_tanglish = any(
-        kw in text_lower
-        for kw in ["maranthuko", "sollu", "mami", "nanba", "machan", "thalli"]
-    )
-    is_hinglish = any(
-        kw in text_lower for kw in ["bhool jao", "batao", "samjha do", "banao"]
-    )
-
-    lang = "English"
-    if is_tanglish:
-        lang = "Tanglish"
-    elif is_hinglish:
-        lang = "Hinglish"
-
-    return {
-        "verdict": "MALICIOUS" if is_malicious else "CLEAN",
-        "risk_score": 0.92 if is_malicious else 0.04,
-        "perplexity_score": 48.6 if is_malicious else 10.2,
-        "vector_drift": 0.81 if is_malicious else 0.01,
-        "reasoning": (
-            "🚨 Threat Detected: System instruction override or multilingual adversarial jailbreak attempt."
-            if is_malicious
-            else "✅ Safe Request: Standard semantic profile, passed all guardrail checks."
-        ),
-        "detected_language": lang,
-        "attack_type": "injection_attempt" if is_malicious else "none",
-    }
 
 
-def format_verdict_html(verdict_text: str) -> str:
-    if "EMPTY" in verdict_text:
+# ---------------------------------------------------------------------------
+# UI formatting (Very Pretty Light Blue Gradient + Crisp White Cards)
+# ---------------------------------------------------------------------------
+def format_verdict_html(kind: str) -> str:
+    if kind == "EMPTY":
         return """
         <div class="verdict-hero verdict-empty">
             <div class="verdict-icon">⚠️</div>
-            <div class="verdict-title">Empty Input</div>
-            <div class="verdict-sub">Please provide a prompt to analyze.</div>
+            <div class="verdict-title">No Document</div>
+            <div class="verdict-sub">Upload a file to scan.</div>
         </div>
         """
-    if "MALICIOUS" in verdict_text:
-        return f"""
+    if kind == "ERROR":
+        return """
+        <div class="verdict-hero verdict-empty">
+            <div class="verdict-icon">⚠️</div>
+            <div class="verdict-title">Read Error</div>
+            <div class="verdict-sub">Could not process this file — see details below.</div>
+        </div>
+        """
+    if kind == "MALICIOUS":
+        return """
         <div class="verdict-hero verdict-malicious">
             <div class="verdict-icon">⛔</div>
             <div class="verdict-title">MALICIOUS</div>
-            <div class="verdict-sub">Blocked — adversarial pattern detected</div>
+            <div class="verdict-sub">Hidden or adversarial content detected in this document</div>
         </div>
         """
-    return f"""
+    return """
     <div class="verdict-hero verdict-clean">
         <div class="verdict-icon">✅</div>
         <div class="verdict-title">CLEAN</div>
-        <div class="verdict-sub">Passed — no injection signals detected</div>
+        <div class="verdict-sub">No injection or hidden-content signals detected</div>
     </div>
     """
 
 
-def format_metric_card(label: str, value: str, accent: str = "") -> str:
-    return f"""
-    <div class="metric-card {accent}">
-        <div class="metric-label">{label}</div>
-        <div class="metric-value">{value}</div>
-    </div>
-    """
-
-
-def format_meta_chip(label: str, value: str) -> str:
+def format_language_html(language: str) -> str:
+    if not language:
+        return ""
     return f"""
     <div class="meta-chip">
-        <span class="meta-chip-label">{label}</span>
-        <span class="meta-chip-value">{value}</span>
+        <span class="meta-chip-label">Detected Language</span>
+        <span class="meta-chip-value">{language}</span>
     </div>
     """
-
-
-def check_prompt(text):
-    if not text.strip():
-        return (
-            format_verdict_html("⚠️ EMPTY INPUT"),
-            format_metric_card("Risk Score", "0.00", "accent-neutral"),
-            format_metric_card("Perplexity", "0.0", "accent-neutral"),
-            format_metric_card("Vector Drift", "0.00", "accent-neutral"),
-            "Please provide a prompt to analyze.",
-            format_meta_chip("Detected Language", "Unknown"),
-            format_meta_chip("Attack Category", "none"),
-        )
-
-    try:
-        response = requests.post(
-            API_URL,
-            json={"prompt": text},
-            timeout=3.0,
-        )
-        if response.status_code == 200:
-            final = response.json()
-        else:
-            final = get_mock_response(text)
-    except Exception:
-        final = get_mock_response(text)
-
-    verdict_str = final.get("verdict", "UNKNOWN")
-    if verdict_str == "MALICIOUS":
-        formatted_verdict = "🔴 MALICIOUS — BLOCKED"
-        accent = "accent-danger"
-    else:
-        formatted_verdict = "🟢 CLEAN — PASSED"
-        accent = "accent-safe"
-
-    risk = f"{float(final.get('risk_score', 0.0)):.2f}"
-    perp = f"{float(final.get('perplexity_score', 0.0)):.1f}"
-    drift = f"{float(final.get('vector_drift', 0.0)):.2f}"
-    reasoning = final.get("reasoning", "N/A")
-    language = final.get("detected_language", "N/A")
-    attack = final.get("attack_type", "none")
-
-    return (
-        format_verdict_html(formatted_verdict),
-        format_metric_card("Risk Score", risk, accent),
-        format_metric_card("Perplexity", perp, accent),
-        format_metric_card("Vector Drift", drift, accent),
-        reasoning,
-        format_meta_chip("Detected Language", language),
-        format_meta_chip("Attack Category", attack),
-    )
 
 
 custom_theme = gr.themes.Base(
-    primary_hue="red",
-    secondary_hue="neutral",
-    neutral_hue="neutral",
+    primary_hue="sky",
+    secondary_hue="slate",
+    neutral_hue="slate",
     font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui"],
     font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "ui-monospace"],
 ).set(
-    body_background_fill="#121214",
-    block_background_fill="transparent",
-    block_border_width="0px",
-    block_radius="12px",
-    block_label_text_color="#8b8b8f",
-    body_text_color="#ececec",
-    input_background_fill="#1c1c1f",
-    input_border_color="rgba(255,255,255,0.08)",
-    button_primary_background_fill="#e5484d",
-    button_primary_background_fill_hover="#f2555a",
+    body_background_fill="linear-gradient(135deg, #e0f2fe 0%, #f0f7ff 50%, #e8f4fe 100%)",
+    block_background_fill="#ffffff",
+    block_border_width="1px",
+    block_radius="16px",
+    block_label_text_color="#475569",
+    body_text_color="#0f172a",
+    input_background_fill="#ffffff",
+    input_border_color="#bae6fd",
+    button_primary_background_fill="#0284c7",
+    button_primary_background_fill_hover="#0369a1",
     button_primary_text_color="#ffffff",
 )
 
 custom_css = """
 * { box-sizing: border-box; }
 .gradio-container {
-    max-width: 1140px !important;
-    background: #121214 !important;
+    max-width: 920px !important;
+    background: linear-gradient(135deg, #e0f2fe 0%, #f0f7ff 50%, #e8f4fe 100%) !important;
+    font-family: 'Inter', system-ui, sans-serif !important;
+    color: #0f172a !important;
 }
-/* ── AngelHack-style hero banner ── */
+
 #header-banner {
     position: relative;
     overflow: hidden;
-    background: linear-gradient(120deg, #4a0e0e 0%, #2a0810 50%, #121214 100%);
-    border-radius: 16px;
-    padding: 40px 44px;
+    background: #ffffff !important;
+    border-radius: 20px;
+    padding: 38px 42px;
     margin-bottom: 20px;
-    border: 1px solid rgba(229,72,77,0.2);
+    border: 1px solid #bae6fd;
+    box-shadow: 0 12px 32px -8px rgba(2, 132, 199, 0.12), 0 4px 12px rgba(0, 0, 0, 0.03);
 }
-#header-banner::after {
+
+#header-banner::before {
     content: "";
     position: absolute;
-    top: 20px; right: 28px;
-    width: 80px; height: 60px;
-    background: repeating-linear-gradient(
-        0deg,
-        #e5484d 0px, #e5484d 8px,
-        transparent 8px, transparent 16px
-    );
-    opacity: 0.55;
+    top: 0; right: 0; bottom: 0; left: 0;
+    background-image: radial-gradient(rgba(2, 132, 199, 0.08) 1px, transparent 1px);
+    background-size: 20px 20px;
     pointer-events: none;
+    opacity: 0.6;
 }
+
 #header-banner .eyebrow {
     display: inline-block;
     font-size: 0.68rem;
     font-weight: 700;
     letter-spacing: 0.14em;
     text-transform: uppercase;
-    color: #f4a8a8;
-    background: rgba(229,72,77,0.12);
-    border: 1px solid rgba(244,168,168,0.3);
-    padding: 5px 12px;
+    color: #0284c7;
+    background: #e0f2fe;
+    border: 1px solid #bae6fd;
+    padding: 6px 14px;
     border-radius: 999px;
     margin-bottom: 14px;
 }
+
 #header-banner h1 {
     margin: 0 0 8px 0;
     font-size: 2rem;
     font-weight: 800;
     letter-spacing: -0.02em;
-    color: #ffffff;
+    color: #0f172a;
 }
+
 #header-banner p {
     margin: 0;
-    max-width: 560px;
-    color: rgba(255,255,255,0.65);
-    font-size: 0.95rem;
-    line-height: 1.55;
+    max-width: 580px;
+    color: #475569;
+    font-size: 0.96rem;
+    line-height: 1.6;
 }
-.header-stats {
-    display: flex;
-    gap: 10px;
-    margin-top: 22px;
-    flex-wrap: wrap;
-}
-.header-stat {
-    background: rgba(255,255,255,0.05);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 999px;
-    padding: 6px 14px;
-    font-size: 0.75rem;
-    color: #8b8b8f;
-}
-.header-stat strong { color: #ececec; }
-/* ── Signals-style panels ── */
+
 .panel {
-    background: #1c1c1f;
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 12px;
-    padding: 20px 22px;
-    margin-bottom: 12px;
+    background: #ffffff !important;
+    border: 1px solid #bae6fd !important;
+    border-radius: 18px !important;
+    padding: 24px 26px !important;
+    margin-bottom: 16px !important;
+    box-shadow: 0 8px 24px -4px rgba(2, 132, 199, 0.08), 0 2px 6px rgba(0,0,0,0.02) !important;
 }
+
 .panel-header {
     display: flex;
     align-items: center;
-    gap: 10px;
-    margin-bottom: 14px;
+    gap: 12px;
+    margin-bottom: 16px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #f0f7ff;
 }
+
 .panel-icon {
-    width: 28px; height: 28px;
-    background: rgba(255,255,255,0.05);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 8px;
+    width: 32px; height: 32px;
+    background: #e0f2fe;
+    border: 1px solid #bae6fd;
+    border-radius: 10px;
     display: flex; align-items: center; justify-content: center;
-    font-size: 0.85rem;
+    font-size: 0.9rem;
 }
+
 .panel-title {
-    font-size: 0.72rem;
-    font-weight: 600;
+    font-size: 0.75rem;
+    font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.1em;
-    color: #8b8b8f;
+    color: #0369a1;
 }
+
 #run-btn {
-    height: 50px !important;
-    font-size: 0.95rem !important;
-    font-weight: 600 !important;
-    border-radius: 10px !important;
-    box-shadow: none !important;
-    background: #e5484d !important;
+    height: 52px !important;
+    font-size: 0.98rem !important;
+    font-weight: 700 !important;
+    border-radius: 12px !important;
+    box-shadow: 0 6px 20px rgba(2, 132, 199, 0.25) !important;
+    background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%) !important;
+    color: #ffffff !important;
+    border: none !important;
+    transition: all 0.2s ease !important;
 }
-/* ── Verdict hero ── */
+
+#run-btn:hover {
+    transform: translateY(-1px) !important;
+    box-shadow: 0 8px 25px rgba(2, 132, 199, 0.4) !important;
+}
+
 .verdict-hero {
-    border-radius: 12px;
+    border-radius: 14px;
     padding: 28px 24px;
     text-align: center;
 }
-.verdict-icon  { font-size: 2rem; margin-bottom: 6px; }
-.verdict-title { font-size: 1.4rem; font-weight: 700; letter-spacing: 0.05em; margin-bottom: 4px; }
-.verdict-sub   { font-size: 0.82rem; color: #8b8b8f; }
+
+.verdict-icon  { font-size: 2.2rem; margin-bottom: 6px; }
+.verdict-title { font-size: 1.45rem; font-weight: 800; letter-spacing: 0.04em; margin-bottom: 4px; }
+.verdict-sub   { font-size: 0.88rem; color: #475569; }
+
 .verdict-clean {
-    background: rgba(48,164,108,0.08);
-    border: 1px solid rgba(48,164,108,0.35);
+    background: #ecfdf5;
+    border: 1px solid #a7f3d0;
 }
-.verdict-clean .verdict-title { color: #30a46c; }
+
+.verdict-clean .verdict-title { color: #047857; }
+
 .verdict-malicious {
-    background: rgba(229,72,77,0.08);
-    border: 1px solid rgba(229,72,77,0.4);
+    background: #fef2f2;
+    border: 1px solid #fecaca;
     animation: pulse-critical 2.5s ease-in-out infinite;
 }
-.verdict-malicious .verdict-title { color: #e5484d; }
+
+.verdict-malicious .verdict-title { color: #dc2626; }
+
 .verdict-empty {
-    background: rgba(255,255,255,0.03);
-    border: 1px solid rgba(255,255,255,0.08);
+    background: #f0f9ff;
+    border: 1px solid #bae6fd;
 }
-.verdict-empty .verdict-title { color: #ffb224; }
+
+.verdict-empty .verdict-title { color: #0284c7; }
+
 @keyframes pulse-critical {
-    0%, 100% { border-color: rgba(229,72,77,0.4); }
-    50%      { border-color: rgba(229,72,77,0.75); }
+    0%, 100% { border-color: rgba(239, 68, 68, 0.4); }
+    50%      { border-color: rgba(239, 68, 68, 0.85); }
 }
-/* ── KPI metric cards (Signals-style) ── */
-.metric-card {
-    background: #232326;
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 12px;
-    padding: 18px 16px;
-    text-align: left;
-    border-left: 3px solid rgba(255,255,255,0.12);
-}
-.metric-card.accent-safe    { border-left-color: #30a46c; }
-.metric-card.accent-danger  { border-left-color: #e5484d; }
-.metric-card.accent-neutral { border-left-color: #0091ff; }
-.metric-label {
-    font-size: 0.68rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: #8b8b8f;
-    margin-bottom: 6px;
-}
-.metric-value {
-    font-family: "JetBrains Mono", ui-monospace, monospace;
-    font-size: 1.75rem;
-    font-weight: 700;
-    color: #ececec;
-}
-/* ── Meta pills ── */
+
 .meta-chip {
-    background: #232326;
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 10px;
-    padding: 12px 16px;
-    margin-bottom: 8px;
+    background: #f0f9ff;
+    border: 1px solid #bae6fd;
+    border-radius: 12px;
+    padding: 12px 18px;
+    margin-top: 10px;
 }
+
 .meta-chip-label {
     display: inline-block;
-    font-size: 0.65rem;
-    font-weight: 600;
+    font-size: 0.68rem;
+    font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    color: #8b8b8f;
+    color: #0369a1;
     margin-bottom: 4px;
 }
+
 .meta-chip-value {
     display: block;
-    font-size: 0.9rem;
-    font-weight: 600;
-    color: #ececec;
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: #0f172a;
     font-family: "JetBrains Mono", ui-monospace, monospace;
 }
-.reasoning-box textarea {
+
+.hidden-box textarea {
     font-size: 0.88rem !important;
-    line-height: 1.6 !important;
-    color: #ececec !important;
-    background: #232326 !important;
-    border: 1px solid rgba(255,255,255,0.08) !important;
-    border-radius: 10px !important;
+    line-height: 1.65 !important;
+    color: #0f172a !important;
+    background: #f8fafc !important;
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 12px !important;
+    font-family: "JetBrains Mono", ui-monospace, monospace !important;
 }
+
 .footnote {
     text-align: center;
-    color: #555558;
-    font-size: 0.75rem;
-    margin-top: 4px;
+    color: #475569;
+    font-size: 0.78rem;
+    margin-top: 6px;
+    font-weight: 500;
 }
+
 footer { visibility: hidden; }
-label span, .label-wrap span { color: #8b8b8f !important; }
-textarea, input { color: #ececec !important; }
+label span, .label-wrap span { color: #334155 !important; font-weight: 600 !important; }
 """
 
-test_case_options = [
-    f"{c['id']} · {c['language']} · {CATEGORY_LABELS.get(c['category'], c['category'])}"
-    for c in test_suite
-]
+with gr.Blocks(theme=custom_theme, css=custom_css, title="Document Injection Scanner") as demo:
 
-with gr.Blocks(theme=custom_theme, css=custom_css, title="Gemma Guard Firewall") as demo:
-
-    gr.HTML(f"""
+    gr.HTML("""
     <div id="header-banner">
         <span class="eyebrow">Gemma Hackathon · AI Shield</span>
-        <h1>Multilingual Prompt Injection Firewall</h1>
-        <p>Real-time adversarial detection with vector drift &amp; perplexity monitoring.</p>
-        <div class="header-stats">
-            <span class="header-stat"><strong>{len(test_suite)}</strong> benchmark cases</span>
-            <span class="header-stat"><strong>3</strong> languages</span>
-            <span class="header-stat"><strong>Dual-signal</strong> guardrail</span>
-        </div>
-        <svg style="position:absolute;bottom:0;right:40px;opacity:0.12;width:180px"
-             viewBox="0 0 100 120" fill="#e5484d">
-          <path d="M50 5 L90 20 V55 C90 80 70 100 50 115 C30 100 10 80 10 55 V20 Z"/>
-        </svg>
+        <h1>Document Injection Scanner</h1>
+        <p>Upload a document. We scan the visible content and any hidden or obfuscated
+        payloads — zero-width characters, base64-encoded instructions — for injection attempts.</p>
     </div>
     """)
 
-    # ── Input panel ──────────────────────────────────────────────────────────
     with gr.Group(elem_classes="panel"):
-        gr.HTML('<div class="panel-header"><div class="panel-icon">📥</div><div class="panel-title">Input</div></div>')
-        inp = gr.Textbox(
-            label="Prompt to Analyze",
-            lines=5,
-            placeholder="Type a prompt, or pick a benchmark case below…",
-            show_label=True,
-            elem_classes="reasoning-box",
+        gr.HTML('<div class="panel-header"><div class="panel-icon">📄</div><div class="panel-title">Upload Document</div></div>')
+        file_input = gr.File(
+            label="Document (.txt, .md, .pdf, .docx)",
+            file_types=[".txt", ".md", ".pdf", ".docx", ".csv", ".log"],
         )
-        with gr.Row():
-            preset_dropdown = gr.Dropdown(
-                choices=["Select a test case…"] + test_case_options,
-                value="Select a test case…",
-                label="🧪 Preset Benchmark",
-                scale=4,
-            )
-            btn = gr.Button(
-                "🔍  Run Security Audit",
-                variant="primary",
-                size="lg",
-                elem_id="run-btn",
-                scale=1,
-            )
+        btn = gr.Button("🔍  Scan Document", variant="primary", size="lg", elem_id="run-btn")
 
-    # ── Verdict hero ─────────────────────────────────────────────────────────
     with gr.Group(elem_classes="panel"):
         gr.HTML('<div class="panel-header"><div class="panel-icon">🛡️</div><div class="panel-title">Verdict</div></div>')
-        verdict_html = gr.HTML(format_verdict_html(""))
+        verdict_html = gr.HTML(format_verdict_html("EMPTY"))
+        language_html = gr.HTML("")
 
-    # ── Telemetry metrics ────────────────────────────────────────────────────
     with gr.Group(elem_classes="panel"):
-        gr.HTML('<div class="panel-header"><div class="panel-icon">📊</div><div class="panel-title">Telemetry</div></div>')
-        with gr.Row():
-            risk_html  = gr.HTML(format_metric_card("Risk Score", "—", "accent-neutral"))
-            perp_html  = gr.HTML(format_metric_card("Perplexity", "—", "accent-neutral"))
-            drift_html = gr.HTML(format_metric_card("Vector Drift", "—", "accent-neutral"))
+        gr.HTML('<div class="panel-header"><div class="panel-icon">🕵️</div><div class="panel-title">Hidden / Obfuscated Content</div></div>')
+        hidden_text_box = gr.Textbox(
+            label=None,
+            show_label=False,
+            lines=6,
+            interactive=False,
+            placeholder="Scan a document to see any hidden or obfuscated content found…",
+            elem_classes="hidden-box",
+        )
 
-    # ── Reasoning + meta ─────────────────────────────────────────────────────
-    with gr.Row():
-        with gr.Column():
-            with gr.Group(elem_classes="panel"):
-                gr.HTML('<div class="panel-header"><div class="panel-icon">📝</div><div class="panel-title">Guard Reasoning</div></div>')
-                reasoning = gr.Textbox(
-                    label=None,
-                    lines=3,
-                    interactive=False,
-                    show_label=False,
-                    placeholder="Run an audit to see guard reasoning…",
-                    elem_classes="reasoning-box",
-                )
-        with gr.Column():
-            with gr.Group(elem_classes="panel"):
-                gr.HTML('<div class="panel-header"><div class="panel-icon">🔍</div><div class="panel-title">Detection Meta</div></div>')
-                lang_html    = gr.HTML(format_meta_chip("Detected Language", "—"))
-                attack_html  = gr.HTML(format_meta_chip("Attack Category", "—"))
+    gr.HTML('<div class="footnote">Detects direct keyword-based injection, zero-width character smuggling, and base64-obfuscated payloads</div>')
 
-    gr.HTML('<div class="footnote">Dual-signal guardrail — Gemma semantic verdict fused with statistical anomaly scoring</div>')
-
-    def load_preset(selected_label):
-        if not selected_label or selected_label.startswith("Select"):
-            return ""
-        case_id = selected_label.split(" · ")[0]
-        matched = next((c for c in test_suite if c["id"] == case_id), None)
-        return matched["prompt"] if matched else ""
-
-    preset_dropdown.change(fn=load_preset, inputs=preset_dropdown, outputs=inp)
-
-    outputs = [verdict_html, risk_html, perp_html, drift_html, reasoning, lang_html, attack_html]
-    btn.click(fn=check_prompt, inputs=inp, outputs=outputs, show_progress="full")
-    inp.submit(fn=check_prompt, inputs=inp, outputs=outputs, show_progress="full")
-
+    btn.click(
+        fn=scan_document,
+        inputs=file_input,
+        outputs=[verdict_html, hidden_text_box, language_html],
+        show_progress="full",
+    )
 
 if __name__ == "__main__":
     demo.launch()
